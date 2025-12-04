@@ -1,0 +1,6 @@
+"Metric","Value","SD"
+"ATE",0.558,0.003
+"Policy_Risk_Proxy",0.1887,0.0128
+"Propensity_Balance",0.1845,0.0037
+"Outcome_MSE",0.464,0.1671
+"HTE_Std",9e-04,4e-04
