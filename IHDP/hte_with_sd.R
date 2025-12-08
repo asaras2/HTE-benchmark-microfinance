@@ -116,9 +116,72 @@ dr_learner_baseline <- function(X, W, Y, Y_cf = NULL) {
   # Clip propensity scores
   e_hat <- pmax(pmin(e_hat, 0.95), 0.05)
   
-  # AIPW pseudo-outcome
-  phi <- (W * (Y - mu1_hat) / e_hat + mu1_hat) - 
-    ((1 - W) * (Y - mu0_hat) / (1 - e_hat) + mu0_hat)
+  # SIEVE ADJUSTMENT STEP
+  cat("  Applying sieve adjustment...\n")
+  
+  # Step 1: Create polynomial sieve basis φ(W) = (1, W, W²)
+  sieve_basis <- as.matrix(X)
+  sieve_basis_sq <- sieve_basis^2
+  colnames(sieve_basis_sq) <- paste0(colnames(sieve_basis), "_sq")
+  
+  # Combine: φ(W) = (1, W, W²)
+  phi_W <- cbind(1, sieve_basis, sieve_basis_sq)
+  colnames(phi_W)[1] <- "intercept"
+  
+  # Step 2: Create treatment-sieve interactions
+  phi_treated <- W * phi_W
+  phi_control <- (1 - W) * phi_W
+  
+  # Combine all sieve features
+  sieve_features <- cbind(phi_treated, phi_control)
+  colnames(sieve_features) <- c(
+    paste0("T1_", colnames(phi_W)),
+    paste0("T0_", colnames(phi_W))
+  )
+  
+  # Step 3: Weighted regression with offset for mu1
+  offset_mu1 <- mu1_hat
+  weights_mu1 <- W / e_hat
+  residual_mu1 <- Y - mu1_hat
+  
+  idx_treated <- which(W == 1)
+  if (length(idx_treated) > ncol(sieve_features)) {
+    sieve_model_mu1 <- lm(
+      residual_mu1[idx_treated] ~ sieve_features[idx_treated, ] - 1,
+      weights = weights_mu1[idx_treated]
+    )
+    beta_mu1 <- coef(sieve_model_mu1)
+    beta_mu1[is.na(beta_mu1)] <- 0
+  } else {
+    beta_mu1 <- rep(0, ncol(sieve_features))
+  }
+  
+  # Step 3: Weighted regression with offset for mu0
+  offset_mu0 <- mu0_hat
+  weights_mu0 <- (1 - W) / (1 - e_hat)
+  residual_mu0 <- Y - mu0_hat
+  
+  idx_control <- which(W == 0)
+  if (length(idx_control) > ncol(sieve_features)) {
+    sieve_model_mu0 <- lm(
+      residual_mu0[idx_control] ~ sieve_features[idx_control, ] - 1,
+      weights = weights_mu0[idx_control]
+    )
+    beta_mu0 <- coef(sieve_model_mu0)
+    beta_mu0[is.na(beta_mu0)] <- 0
+  } else {
+    beta_mu0 <- rep(0, ncol(sieve_features))
+  }
+  
+  # Step 4: Construct refined μ*
+  mu1_star <- mu1_hat + as.vector(sieve_features %*% beta_mu1)
+  mu0_star <- mu0_hat + as.vector(sieve_features %*% beta_mu0)
+  
+  cat("  Sieve adjustment complete!\n")
+  
+  # AIPW pseudo-outcome using refined μ*
+  phi <- (W * (Y - mu1_star) / e_hat + mu1_star) - 
+    ((1 - W) * (Y - mu0_star) / (1 - e_hat) + mu0_star)
   
   # Regress on X
   dr_model <- ranger(y = phi, x = data.frame(X), num.trees = 500)
@@ -208,8 +271,74 @@ calculate_ate_att_hte3 <- function(X, T, Y, Y_cf = NULL) {
     mu1_hat[test_idx] <- predict(mu1_model, data = X_test)$predictions
   }
   
-  # Calculate CATE estimates
-  tau_hat <- mu1_hat - mu0_hat
+  # Clip propensity scores
+  pi_hat <- pmax(pmin(pi_hat, 0.95), 0.05)
+  
+  # SIEVE ADJUSTMENT STEP
+  cat("Applying sieve adjustment...\n")
+  
+  # Step 1: Create polynomial sieve basis φ(W) = (1, W, W²)
+  sieve_basis <- as.matrix(X)
+  sieve_basis_sq <- sieve_basis^2
+  colnames(sieve_basis_sq) <- paste0(colnames(sieve_basis), "_sq")
+  
+  # Combine: φ(W) = (1, W, W²)
+  phi_W <- cbind(1, sieve_basis, sieve_basis_sq)
+  colnames(phi_W)[1] <- "intercept"
+  
+  # Step 2: Create treatment-sieve interactions
+  phi_treated <- T * phi_W
+  phi_control <- (1 - T) * phi_W
+  
+  # Combine all sieve features
+  sieve_features <- cbind(phi_treated, phi_control)
+  colnames(sieve_features) <- c(
+    paste0("T1_", colnames(phi_W)),
+    paste0("T0_", colnames(phi_W))
+  )
+  
+  # Step 3: Weighted regression with offset for mu1
+  offset_mu1 <- mu1_hat
+  weights_mu1 <- T / pi_hat
+  residual_mu1 <- Y - mu1_hat
+  
+  idx_treated <- which(T == 1)
+  if (length(idx_treated) > ncol(sieve_features)) {
+    sieve_model_mu1 <- lm(
+      residual_mu1[idx_treated] ~ sieve_features[idx_treated, ] - 1,
+      weights = weights_mu1[idx_treated]
+    )
+    beta_mu1 <- coef(sieve_model_mu1)
+    beta_mu1[is.na(beta_mu1)] <- 0
+  } else {
+    beta_mu1 <- rep(0, ncol(sieve_features))
+  }
+  
+  # Step 3: Weighted regression with offset for mu0
+  offset_mu0 <- mu0_hat
+  weights_mu0 <- (1 - T) / (1 - pi_hat)
+  residual_mu0 <- Y - mu0_hat
+  
+  idx_control <- which(T == 0)
+  if (length(idx_control) > ncol(sieve_features)) {
+    sieve_model_mu0 <- lm(
+      residual_mu0[idx_control] ~ sieve_features[idx_control, ] - 1,
+      weights = weights_mu0[idx_control]
+    )
+    beta_mu0 <- coef(sieve_model_mu0)
+    beta_mu0[is.na(beta_mu0)] <- 0
+  } else {
+    beta_mu0 <- rep(0, ncol(sieve_features))
+  }
+  
+  # Step 4: Construct refined μ*
+  mu1_star <- mu1_hat + as.vector(sieve_features %*% beta_mu1)
+  mu0_star <- mu0_hat + as.vector(sieve_features %*% beta_mu0)
+  
+  cat("Sieve adjustment complete!\n")
+  
+  # Calculate CATE estimates using refined μ*
+  tau_hat <- mu1_star - mu0_star
   
   # Calculate ATE (average over all units)
   ate_estimate <- mean(tau_hat)
@@ -294,14 +423,27 @@ calculate_metrics <- function(tau_hat, true_ite, T, Y, Y_cf, method_name = "Meth
     # For treated units (T=1): Y(1) = Y (observed), Y(0) = Y_cf (counterfactual)
     # For control units (T=0): Y(0) = Y (observed), Y(1) = Y_cf (counterfactual)
     
+    # Debug: Print vector lengths
+    cat("Debug - Vector lengths: T_sub=", length(T_sub), 
+        ", Y_sub=", length(Y_sub), 
+        ", Y_cf_sub=", length(Y_cf_sub),
+        ", tau_hat_sub=", length(tau_hat_sub),
+        ", true_ite_sub=", length(true_ite_sub), "\n")
+    
     # Validate inputs
     if (length(T_sub) == 0 || length(Y_sub) == 0 || length(Y_cf_sub) == 0) {
+      cat("Error: Empty vectors detected!\n")
       return(c(pehe = NA, ate_risk = NA, policy_risk = NA, att_risk = NA))
     }
     
     # Ensure all vectors have the same length
     n_sub <- length(T_sub)
     if (length(Y_sub) != n_sub || length(Y_cf_sub) != n_sub || length(tau_hat_sub) != n_sub || length(true_ite_sub) != n_sub) {
+      cat("Error: Vector length mismatch! n_sub=", n_sub, 
+          ", Y_sub=", length(Y_sub),
+          ", Y_cf_sub=", length(Y_cf_sub),
+          ", tau_hat_sub=", length(tau_hat_sub),
+          ", true_ite_sub=", length(true_ite_sub), "\n")
       return(c(pehe = NA, ate_risk = NA, policy_risk = NA, att_risk = NA))
     }
     

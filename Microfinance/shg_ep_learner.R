@@ -1,117 +1,77 @@
 
 # EP-Learner Analysis for SHG Participation and Savings
-# Simplified version with better error handling
+# Calculates 5 metrics with bootstrap standard deviations
 
-library(haven)      # For reading .dta files
-library(ranger)     # For random forests
-library(dplyr)      # For data manipulation
+library(haven)
+library(ranger)
+library(dplyr)
 
 ################################################################################
 # CONFIGURATION
 ################################################################################
 
-NUM_TREES <- 100    # Reduced for faster training
-NUM_FOLDS <- 3      # Reduced to avoid small sample issues
-BOOTSTRAP_ITERATIONS <- 50  # Reduced for speed
+NUM_TREES <- 100
+NUM_FOLDS <- 3
+BOOTSTRAP_ITERATIONS <- 100
 
 ################################################################################
 # STEP 1: LOAD AND PREPARE DATA
 ################################################################################
 
 cat("\n=== Loading Data ===\n")
-
-# Load Stata file
 data <- read_dta("individual_characteristics.dta")
-
-cat("Data loaded successfully!\n")
 cat("Total observations:", nrow(data), "\n")
 
 # Select and clean data
 # IMPORTANT: shgparticipate is coded as 1=Yes, 2=No in Stata
-# We need to recode: 1 (Yes) -> 1 (treated), 2 (No) -> 0 (control)
 analysis_data <- data %>%
-  select(
-    shgparticipate,
-    savings,
-    age,
-    resp_gend,
-    rationcard,
-    workflag
-  ) %>%
+  select(shgparticipate, savings, age, resp_gend, rationcard, workflag) %>%
   filter(
-    shgparticipate %in% c(1, 2),  # Keep only valid responses
-    savings %in% c(1, 2)           # Keep only valid responses
+    shgparticipate %in% c(1, 2),
+    savings %in% c(1, 2)
   ) %>%
   mutate(
-    # Recode treatment: 1=Yes (participated) -> 1, 2=No -> 0
     shgparticipate = ifelse(shgparticipate == 1, 1, 0),
-    # Recode outcome: 1=Yes (has savings) -> 1, 2=No -> 0
     savings = ifelse(savings == 1, 1, 0)
   ) %>%
-  na.omit()  # Remove rows with missing values
+  na.omit()
 
-cat("After cleaning and recoding:", nrow(analysis_data), "\n")
+cat("After cleaning:", nrow(analysis_data), "\n")
 
 # Extract components
 T <- as.numeric(analysis_data$shgparticipate)
 Y <- as.numeric(analysis_data$savings)
-X <- analysis_data %>% 
-  select(age, resp_gend, rationcard, workflag) %>%
-  as.data.frame()
+X <- analysis_data %>% select(age, resp_gend, rationcard, workflag) %>% as.data.frame()
 
-cat("\nData summary:\n")
-cat("Treatment (SHG participation): 0=", sum(T==0), ", 1=", sum(T==1), "\n")
-cat("Outcome (Has savings): 0=", sum(Y==0), ", 1=", sum(Y==1), "\n")
-cat("Number of covariates:", ncol(X), "\n")
+cat("Treatment: 0=", sum(T==0), ", 1=", sum(T==1), "\n")
 
-# Check if we have enough data in each group (lowered threshold)
-if (sum(T==0) < 10 || sum(T==1) < 10) {
-  cat("\nERROR: Insufficient data!\n")
-  cat("Control group (T=0):", sum(T==0), "observations\n")
-  cat("Treated group (T=1):", sum(T==1), "observations\n")
-  stop("Need at least 10 observations in each treatment group for EP-Learner.")
-}
-
-if (sum(T==0) < 30 || sum(T==1) < 30) {
-  cat("\nWARNING: Small sample size detected. Results may be unstable.\n")
-  cat("Consider using a simpler method or collecting more data.\n")
-}
-
-# Split into train/test (80/20)
+# Split train/test
 set.seed(123)
 n <- nrow(X)
-train_idx <- sample(1:n, size = floor(0.8 * n))
+train_idx <- sample(1:n, floor(0.8 * n))
 test_idx <- setdiff(1:n, train_idx)
 
 X_train <- X[train_idx, ]
 T_train <- T[train_idx]
 Y_train <- Y[train_idx]
-
 X_test <- X[test_idx, ]
 T_test <- T[test_idx]
 Y_test <- Y[test_idx]
 
-cat("\nTrain set:", length(train_idx), "observations\n")
-cat("  Control:", sum(T_train==0), ", Treated:", sum(T_train==1), "\n")
-cat("Test set:", length(test_idx), "observations\n")
-cat("  Control:", sum(T_test==0), ", Treated:", sum(T_test==1), "\n")
+cat("Train:", length(train_idx), "| Test:", length(test_idx), "\n")
 
 ################################################################################
-# STEP 2: TRAIN EP-LEARNER WITH ERROR HANDLING
+# STEP 2: TRAIN EP-LEARNER
 ################################################################################
 
 cat("\n=== Training EP-Learner ===\n")
 
 n_train <- nrow(X_train)
 folds <- cut(sample(1:n_train), breaks = NUM_FOLDS, labels = FALSE)
-
-# Initialize storage
 e_hat <- mu0_hat <- mu1_hat <- rep(NA, n_train)
 
-cat("Cross-fitting nuisance functions (", NUM_FOLDS, " folds)...\n")
-
 for (k in 1:NUM_FOLDS) {
-  cat(sprintf("  Fold %d/%d\n", k, NUM_FOLDS))
+  cat(sprintf("Fold %d/%d\n", k, NUM_FOLDS))
   
   test_idx_fold <- which(folds == k)
   train_idx_fold <- which(folds != k)
@@ -121,152 +81,209 @@ for (k in 1:NUM_FOLDS) {
   T_tr <- T_train[train_idx_fold]
   Y_tr <- Y_train[train_idx_fold]
   
-  # Check sample sizes
-  n_control <- sum(T_tr == 0)
-  n_treated <- sum(T_tr == 1)
-  cat(sprintf("    Training fold: %d control, %d treated\n", n_control, n_treated))
+  # Propensity score
+  ps_model <- ranger(y = as.factor(T_tr), x = X_tr, probability = TRUE, 
+                     num.trees = NUM_TREES, min.node.size = 5, verbose = FALSE)
+  e_hat[test_idx_fold] <- predict(ps_model, data = X_te)$predictions[, 2]
   
-  if (n_control < 10 || n_treated < 10) {
-    cat("    Warning: Small sample size in this fold, using simpler model\n")
-  }
+  # Outcome models
+  idx0 <- which(T_tr == 0)
+  idx1 <- which(T_tr == 1)
   
-  # 1. Propensity score
-  tryCatch({
-    ps_model <- ranger(
-      y = as.factor(T_tr), 
-      x = X_tr,
-      probability = TRUE, 
-      num.trees = NUM_TREES,
-      min.node.size = 5,  # Prevent overfitting
-      verbose = FALSE
-    )
-    e_hat[test_idx_fold] <- predict(ps_model, data = X_te)$predictions[, 2]
-  }, error = function(e) {
-    cat("    Error in propensity model, using marginal probability\n")
-    e_hat[test_idx_fold] <<- mean(T_tr)
-  })
+  mu0_model <- ranger(y = Y_tr[idx0], x = X_tr[idx0, ], num.trees = NUM_TREES, 
+                      min.node.size = 5, verbose = FALSE)
+  mu0_hat[test_idx_fold] <- predict(mu0_model, data = X_te)$predictions
   
-  # 2. Outcome model for control
-  tryCatch({
-    idx0 <- which(T_tr == 0)
-    if (length(idx0) >= 10) {
-      mu0_model <- ranger(
-        y = Y_tr[idx0], 
-        x = X_tr[idx0, ],
-        num.trees = NUM_TREES,
-        min.node.size = 5,
-        verbose = FALSE
-      )
-      mu0_hat[test_idx_fold] <- predict(mu0_model, data = X_te)$predictions
-    } else {
-      mu0_hat[test_idx_fold] <- mean(Y_tr[idx0])
-    }
-  }, error = function(e) {
-    cat("    Error in mu0 model, using mean\n")
-    mu0_hat[test_idx_fold] <<- mean(Y_tr[T_tr == 0])
-  })
-  
-  # 3. Outcome model for treated
-  tryCatch({
-    idx1 <- which(T_tr == 1)
-    if (length(idx1) >= 10) {
-      mu1_model <- ranger(
-        y = Y_tr[idx1], 
-        x = X_tr[idx1, ],
-        num.trees = NUM_TREES,
-        min.node.size = 5,
-        verbose = FALSE
-      )
-      mu1_hat[test_idx_fold] <- predict(mu1_model, data = X_te)$predictions
-    } else {
-      mu1_hat[test_idx_fold] <- mean(Y_tr[idx1])
-    }
-  }, error = function(e) {
-    cat("    Error in mu1 model, using mean\n")
-    mu1_hat[test_idx_fold] <<- mean(Y_tr[T_tr == 1])
-  })
+  mu1_model <- ranger(y = Y_tr[idx1], x = X_tr[idx1, ], num.trees = NUM_TREES, 
+                      min.node.size = 5, verbose = FALSE)
+  mu1_hat[test_idx_fold] <- predict(mu1_model, data = X_te)$predictions
 }
 
-# Clip propensity scores
 e_hat <- pmax(pmin(e_hat, 0.95), 0.05)
 
-# Construct efficient pseudo-outcome
-phi <- (mu1_hat - mu0_hat) + 
-  (T_train / e_hat) * (Y_train - mu1_hat) - 
-  ((1 - T_train) / (1 - e_hat)) * (Y_train - mu0_hat)
+################################################################################
+# SIEVE ADJUSTMENT STEP
+################################################################################
 
-cat("\nPseudo-outcome constructed!\n")
-cat("Pseudo-outcome summary:\n")
-print(summary(phi))
+cat("\n=== Sieve Adjustment ===\n")
 
-# Train final CATE model
-cat("\nTraining final CATE model...\n")
-ep_model <- ranger(
-  y = phi, 
-  x = X_train,
-  num.trees = NUM_TREES,
-  verbose = FALSE
+# Step 1: Create polynomial sieve basis φ(W) = (1, W, W²)
+# We'll use all covariates in X_train
+sieve_basis <- as.matrix(X_train)
+sieve_basis_sq <- sieve_basis^2
+colnames(sieve_basis_sq) <- paste0(colnames(sieve_basis), "_sq")
+
+# Combine: φ(W) = (1, W, W²)
+phi_W <- cbind(1, sieve_basis, sieve_basis_sq)
+colnames(phi_W)[1] <- "intercept"
+
+cat("Sieve basis dimensions:", nrow(phi_W), "x", ncol(phi_W), "\n")
+
+# Step 2: Create treatment-sieve interactions
+# A*φ(W) and (1-A)*φ(W)
+phi_treated <- T_train * phi_W
+phi_control <- (1 - T_train) * phi_W
+
+# Combine all sieve features
+sieve_features <- cbind(phi_treated, phi_control)
+colnames(sieve_features) <- c(
+  paste0("T1_", colnames(phi_W)),
+  paste0("T0_", colnames(phi_W))
 )
 
-cat("✓ EP-Learner trained successfully!\n")
+cat("Sieve features created:", ncol(sieve_features), "columns\n")
+
+# Step 3: Weighted regression with offset
+# For mu1 (treated outcome model)
+cat("Refining mu1 with sieve adjustment...\n")
+offset_mu1 <- mu1_hat
+weights_mu1 <- T_train / e_hat
+
+# Residual: Y - μ̂(A,W)
+residual_mu1 <- Y_train - mu1_hat
+
+# Fit weighted regression: residual ~ sieve_features with weights
+# Only use observations where T=1 (treated)
+idx_treated <- which(T_train == 1)
+if (length(idx_treated) > ncol(sieve_features)) {
+  sieve_model_mu1 <- lm(
+    residual_mu1[idx_treated] ~ sieve_features[idx_treated, ] - 1,
+    weights = weights_mu1[idx_treated]
+  )
+  beta_mu1 <- coef(sieve_model_mu1)
+  beta_mu1[is.na(beta_mu1)] <- 0
+} else {
+  beta_mu1 <- rep(0, ncol(sieve_features))
+}
+
+# For mu0 (control outcome model)
+cat("Refining mu0 with sieve adjustment...\n")
+offset_mu0 <- mu0_hat
+weights_mu0 <- (1 - T_train) / (1 - e_hat)
+
+# Residual: Y - μ̂(A,W)
+residual_mu0 <- Y_train - mu0_hat
+
+# Fit weighted regression
+idx_control <- which(T_train == 0)
+if (length(idx_control) > ncol(sieve_features)) {
+  sieve_model_mu0 <- lm(
+    residual_mu0[idx_control] ~ sieve_features[idx_control, ] - 1,
+    weights = weights_mu0[idx_control]
+  )
+  beta_mu0 <- coef(sieve_model_mu0)
+  beta_mu0[is.na(beta_mu0)] <- 0
+} else {
+  beta_mu0 <- rep(0, ncol(sieve_features))
+}
+
+# Step 4: Construct refined μ*
+# μ̂*(a,w) = μ̂(a,w) + β̂ᵀφ(a,w)
+mu1_star <- mu1_hat + as.vector(sieve_features %*% beta_mu1)
+mu0_star <- mu0_hat + as.vector(sieve_features %*% beta_mu0)
+
+cat("✓ Sieve adjustment complete!\n")
+cat("  mu1 adjustment range:", range(mu1_star - mu1_hat), "\n")
+cat("  mu0 adjustment range:", range(mu0_star - mu0_hat), "\n")
+
+# Construct pseudo-outcome using refined μ*
+phi <- (mu1_star - mu0_star) + 
+       (T_train / e_hat) * (Y_train - mu1_star) - 
+       ((1 - T_train) / (1 - e_hat)) * (Y_train - mu0_star)
+
+# Train final model
+ep_model <- ranger(y = phi, x = X_train, num.trees = NUM_TREES, verbose = FALSE)
+cat("✓ Training complete!\n")
 
 ################################################################################
 # STEP 3: PREDICT AND CALCULATE METRICS
 ################################################################################
 
-cat("\n=== Making Predictions on Test Set ===\n")
+cat("\n=== Predictions and Metrics ===\n")
 tau_hat <- predict(ep_model, data = X_test)$predictions
 
-cat("\n=== RESULTS ===\n")
+# Helper function for metrics
+calculate_metrics <- function(idx) {
+  tau_sub <- tau_hat[idx]
+  T_sub <- T_test[idx]
+  Y_sub <- Y_test[idx]
+  
+  # 1. ATE
+  ate <- mean(tau_sub)
+  
+  # 2. HTE Std
+  hte_std <- sd(tau_sub)
+  
+  # 3. Outcome MSE
+  mu0_est <- mean(Y_sub[T_sub == 0])
+  mu1_est <- mean(Y_sub[T_sub == 1])
+  Y_pred <- ifelse(T_sub == 1, mu1_est, mu0_est)
+  outcome_mse <- mean((Y_sub - Y_pred)^2)
+  
+  # 4. Propensity Balance
+  tau_q <- cut(tau_sub, breaks = 5, labels = FALSE)
+  balance <- sapply(1:5, function(q) mean(T_sub[tau_q == q]))
+  prop_balance <- sd(balance, na.rm = TRUE)
+  
+  # 5. Policy Risk Proxy
+  policy <- as.numeric(tau_sub > 0)
+  treat_all <- mean(Y_sub[T_sub == 1])
+  treat_none <- mean(Y_sub[T_sub == 0])
+  n_treat <- sum(policy)
+  n_control <- sum(1 - policy)
+  
+  if (n_treat > 0 && n_control > 0) {
+    policy_val <- (n_treat * treat_all + n_control * treat_none) / length(policy)
+  } else {
+    policy_val <- ifelse(n_treat > 0, treat_all, treat_none)
+  }
+  
+  policy_risk <- max(treat_all, treat_none) - policy_val
+  
+  c(ate = ate, hte_std = hte_std, outcome_mse = outcome_mse, 
+    prop_balance = prop_balance, policy_risk = policy_risk)
+}
 
-# 1. ATE Prediction
-ate_estimate <- mean(tau_hat)
-ate_boot <- replicate(BOOTSTRAP_ITERATIONS, mean(sample(tau_hat, replace=TRUE)))
-ate_se <- sd(ate_boot)
+# Point estimates
+n_test <- length(tau_hat)
+point_est <- calculate_metrics(1:n_test)
 
-cat("\n1. ATE Prediction:", round(ate_estimate, 4), "(SE:", round(ate_se, 4), ")\n")
+# Bootstrap
+cat("Bootstrap (", BOOTSTRAP_ITERATIONS, " iterations)...\n")
+boot_results <- matrix(NA, nrow = BOOTSTRAP_ITERATIONS, ncol = 5)
+colnames(boot_results) <- c("ate", "hte_std", "outcome_mse", "prop_balance", "policy_risk")
 
-# 2. HTE Std
-hte_std <- sd(tau_hat)
-hte_std_boot <- replicate(BOOTSTRAP_ITERATIONS, sd(sample(tau_hat, replace=TRUE)))
-hte_std_se <- sd(hte_std_boot)
+for (i in 1:BOOTSTRAP_ITERATIONS) {
+  if (i %% 20 == 0) cat("  ", i, "/", BOOTSTRAP_ITERATIONS, "\n")
+  boot_idx <- sample(1:n_test, n_test, replace = TRUE)
+  tryCatch({
+    boot_results[i, ] <- calculate_metrics(boot_idx)
+  }, error = function(e) {
+    boot_results[i, ] <- NA
+  })
+}
 
-cat("2. HTE Std:", round(hte_std, 4), "(SE:", round(hte_std_se, 4), ")\n")
+sd_est <- apply(boot_results, 2, sd, na.rm = TRUE)
 
-# 3. Outcome MSE (simple version)
-# Predict outcomes
-mu0_simple <- mean(Y_test[T_test == 0])
-mu1_simple <- mean(Y_test[T_test == 1])
-Y_pred <- ifelse(T_test == 1, mu1_simple, mu0_simple)
-outcome_mse <- mean((Y_test - Y_pred)^2)
+################################################################################
+# STEP 4: DISPLAY RESULTS
+################################################################################
 
-cat("3. Outcome MSE:", round(outcome_mse, 4), "\n")
+cat("\n=== RESULTS ===\n\n")
+cat("1. ATE Prediction:     ", sprintf("%.4f (SD: %.4f)", point_est["ate"], sd_est["ate"]), "\n")
+cat("2. Policy Risk Proxy:  ", sprintf("%.4f (SD: %.4f)", point_est["policy_risk"], sd_est["policy_risk"]), "\n")
+cat("3. Propensity Balance: ", sprintf("%.4f (SD: %.4f)", point_est["prop_balance"], sd_est["prop_balance"]), "\n")
+cat("4. Outcome MSE:        ", sprintf("%.4f (SD: %.4f)", point_est["outcome_mse"], sd_est["outcome_mse"]), "\n")
+cat("5. HTE Std:            ", sprintf("%.4f (SD: %.4f)", point_est["hte_std"], sd_est["hte_std"]), "\n")
 
-# 4. Propensity Balance
-tau_quantiles <- cut(tau_hat, breaks = 5, labels = FALSE)
-balance_test <- sapply(1:5, function(q) mean(T_test[tau_quantiles == q]))
-propensity_balance <- sd(balance_test, na.rm = TRUE)
-
-cat("4. Propensity Balance:", round(propensity_balance, 4), "\n")
-
-# 5. Policy Risk Proxy
-policy_estimated <- as.numeric(tau_hat > 0)
-treat_all_outcome <- mean(Y_test[T_test == 1])
-treat_none_outcome <- mean(Y_test[T_test == 0])
-policy_outcome <- mean(ifelse(policy_estimated == 1, 
-                              Y_test[T_test == 1][1:sum(policy_estimated)],
-                              Y_test[T_test == 0][1:sum(1-policy_estimated)]))
-
-cat("5. Policy Risk Proxy: (comparing policies)\n")
-cat("   Treat all outcome:", round(treat_all_outcome, 4), "\n")
-cat("   Treat none outcome:", round(treat_none_outcome, 4), "\n")
-
-# Summary
 results_df <- data.frame(
-  Metric = c("ATE", "ATE_SE", "HTE_Std", "HTE_Std_SE", "Outcome_MSE", "Propensity_Balance"),
-  Value = round(c(ate_estimate, ate_se, hte_std, hte_std_se, outcome_mse, propensity_balance), 4)
+  Metric = c("ATE", "Policy_Risk_Proxy", "Propensity_Balance", "Outcome_MSE", "HTE_Std"),
+  Value = round(point_est, 4),
+  SD = round(sd_est, 4)
 )
 
+cat("\n")
 print(results_df)
+
 write.csv(results_df, "shg_ep_learner_results.csv", row.names = FALSE)
-cat("\n✓ Results saved!\n")
+cat("\n✓ Results saved to: shg_ep_learner_results.csv\n")

@@ -107,11 +107,96 @@ for (k in 1:NUM_FOLDS) {
 # Clip propensity scores
 e_hat <- pmax(pmin(e_hat, 0.95), 0.05)
 
-# Construct efficient pseudo-outcome
+################################################################################
+# SIEVE ADJUSTMENT STEP
+################################################################################
+
+cat("\n=== Sieve Adjustment ===\n")
+
+# Step 1: Create polynomial sieve basis φ(W) = (1, W, W²)
+# We'll use all covariates in X_train
+sieve_basis <- as.matrix(X_train)
+sieve_basis_sq <- sieve_basis^2
+colnames(sieve_basis_sq) <- paste0(colnames(sieve_basis), "_sq")
+
+# Combine: φ(W) = (1, W, W²)
+phi_W <- cbind(1, sieve_basis, sieve_basis_sq)
+colnames(phi_W)[1] <- "intercept"
+
+cat("Sieve basis dimensions:", nrow(phi_W), "x", ncol(phi_W), "\n")
+
+# Step 2: Create treatment-sieve interactions
+# A*φ(W) and (1-A)*φ(W)
+phi_treated <- T_train * phi_W
+phi_control <- (1 - T_train) * phi_W
+
+# Combine all sieve features
+sieve_features <- cbind(phi_treated, phi_control)
+colnames(sieve_features) <- c(
+  paste0("T1_", colnames(phi_W)),
+  paste0("T0_", colnames(phi_W))
+)
+
+cat("Sieve features created:", ncol(sieve_features), "columns\n")
+
+# Step 3: Weighted regression with offset
+# For mu1 (treated outcome model)
+cat("Refining mu1 with sieve adjustment...\n")
+offset_mu1 <- mu1_hat
+weights_mu1 <- T_train / e_hat
+
+# Residual: Y - μ̂(A,W)
+residual_mu1 <- Y_train - mu1_hat
+
+# Fit weighted regression: residual ~ sieve_features with weights
+# Only use observations where T=1 (treated)
+idx_treated <- which(T_train == 1)
+if (length(idx_treated) > ncol(sieve_features)) {
+  sieve_model_mu1 <- lm(
+    residual_mu1[idx_treated] ~ sieve_features[idx_treated, ] - 1,
+    weights = weights_mu1[idx_treated]
+  )
+  beta_mu1 <- coef(sieve_model_mu1)
+  beta_mu1[is.na(beta_mu1)] <- 0
+} else {
+  beta_mu1 <- rep(0, ncol(sieve_features))
+}
+
+# For mu0 (control outcome model)
+cat("Refining mu0 with sieve adjustment...\n")
+offset_mu0 <- mu0_hat
+weights_mu0 <- (1 - T_train) / (1 - e_hat)
+
+# Residual: Y - μ̂(A,W)
+residual_mu0 <- Y_train - mu0_hat
+
+# Fit weighted regression
+idx_control <- which(T_train == 0)
+if (length(idx_control) > ncol(sieve_features)) {
+  sieve_model_mu0 <- lm(
+    residual_mu0[idx_control] ~ sieve_features[idx_control, ] - 1,
+    weights = weights_mu0[idx_control]
+  )
+  beta_mu0 <- coef(sieve_model_mu0)
+  beta_mu0[is.na(beta_mu0)] <- 0
+} else {
+  beta_mu0 <- rep(0, ncol(sieve_features))
+}
+
+# Step 4: Construct refined μ*
+# μ̂*(a,w) = μ̂(a,w) + β̂ᵀφ(a,w)
+mu1_star <- mu1_hat + as.vector(sieve_features %*% beta_mu1)
+mu0_star <- mu0_hat + as.vector(sieve_features %*% beta_mu0)
+
+cat("✓ Sieve adjustment complete!\n")
+cat("  mu1 adjustment range:", range(mu1_star - mu1_hat), "\n")
+cat("  mu0 adjustment range:", range(mu0_star - mu0_hat), "\n")
+
+# Construct efficient pseudo-outcome using refined μ*
 cat("\nConstructing pseudo-outcomes...\n")
-phi <- (mu1_hat - mu0_hat) + 
-       (T_train / e_hat) * (Y_train - mu1_hat) - 
-       ((1 - T_train) / (1 - e_hat)) * (Y_train - mu0_hat)
+phi <- (mu1_star - mu0_star) + 
+       (T_train / e_hat) * (Y_train - mu1_star) - 
+       ((1 - T_train) / (1 - e_hat)) * (Y_train - mu0_star)
 
 cat("Pseudo-outcome summary:\n")
 print(summary(phi))
@@ -176,8 +261,19 @@ Y_test <- test_data$yf
 Y_cf_test <- if("ycf" %in% names(test_data)) test_data$ycf else rep(NA, nrow(test_data))
 true_ite_test <- if("ite" %in% names(test_data)) test_data$ite else if("tau" %in% names(test_data)) test_data$tau else rep(NA, nrow(test_data))
 
+# If Y_cf is missing but true_ite is available, compute Y_cf
+if (any(is.na(Y_cf_test)) && !any(is.na(true_ite_test))) {
+  cat("Note: Y_cf is missing. Computing from true ITE...\n")
+  # For treated (T=1): Y_cf = Y(0) = Y(1) - ITE = Y - ITE
+  # For control (T=0): Y_cf = Y(1) = Y(0) + ITE = Y + ITE
+  Y_cf_test <- Y_test - (2 * T_test - 1) * true_ite_test
+  cat("Y_cf computed successfully!\n")
+}
+
 cat("Test data loaded!\n")
-cat("N =", nrow(X_test), ", P =", ncol(X_test), "\n\n")
+cat("N =", nrow(X_test), ", P =", ncol(X_test), "\n")
+cat("Y_cf NAs:", sum(is.na(Y_cf_test)), "\n")
+cat("true_ite NAs:", sum(is.na(true_ite_test)), "\n\n")
 
 ################################################################################
 # STEP 5: MAKE PREDICTIONS
